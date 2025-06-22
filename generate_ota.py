@@ -1,27 +1,39 @@
 import os
 import sys
-import subprocess
 import hashlib
 import json
 import re
 from datetime import datetime
 
-# Helper to install packages if missing
-def install_package(pkg):
-    print(f"⚠️ Package '{pkg}' not found. Installing it...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
 try:
-    import requests
-except ImportError:
-    install_package("requests")
-    import requests
-
-try:
+    import boto3
+    from boto3.s3.transfer import TransferConfig
     from tqdm import tqdm
 except ImportError:
-    install_package("tqdm")
+    print("Installing required packages...")
+    os.system(f"{sys.executable} -m pip install --user boto3 tqdm")
+    import boto3
+    from boto3.s3.transfer import TransferConfig
     from tqdm import tqdm
+
+class ReadFileWithProgress:
+    def __init__(self, file_path, progress):
+        self.f = open(file_path, "rb")
+        self.progress = progress
+
+    def read(self, chunk_size):
+        data = self.f.read(chunk_size)
+        if not data:
+            return b""
+        self.progress.update(len(data))
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.f.close()
+        self.progress.close()
 
 def sha256sum(filename):
     h = hashlib.sha256()
@@ -30,109 +42,66 @@ def sha256sum(filename):
             h.update(chunk)
     return h.hexdigest()
 
-def read_github_token(token_file=None):
-    if token_file is None:
-        script_dir = os.path.abspath(os.path.dirname(__file__))
-        token_file = os.path.join(script_dir, "token.txt")
+def upload_to_r2(bucket_name, file_path, r2_endpoint, access_key, secret_key):
+    session = boto3.session.Session()
+    s3 = session.client(
+        service_name="s3",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        endpoint_url=r2_endpoint
+    )
+
+    config = TransferConfig(
+        multipart_threshold=5 * 1024 * 1024,
+        multipart_chunksize=5 * 1024 * 1024,
+        use_threads=True
+    )
+
+    filename = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+
     try:
-        with open(token_file, "r") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        print(f"❌ GitHub token file not found: {token_file}")
+        print(f"\n☁️  Uploading {file_path} to R2 bucket: {bucket_name}")
+        with tqdm(total=file_size, unit="B", unit_scale=True, desc=filename) as progress:
+            with ReadFileWithProgress(file_path, progress) as fp:
+                s3.upload_fileobj(
+                    Fileobj=fp,
+                    Bucket=bucket_name,
+                    Key=filename,
+                    ExtraArgs={"ACL": "public-read"},
+                    Config=config
+                )
+        print(f"✅ Uploaded to R2: {filename}")
+    except Exception as e:
+        print(f"❌ Failed to upload {filename} to R2: {e}")
         sys.exit(1)
 
-def detect_repo_from_git():
-    try:
-        git_dir = os.path.abspath(os.path.dirname(__file__))
-        result = subprocess.check_output(
-            ["git", "remote", "get-url", "origin"],
-            cwd=git_dir,
-            stderr=subprocess.DEVNULL
-        ).decode().strip()
-        match = re.search(r"(?:github\.com[:/])([^/]+/[^/.]+)", result)
-        if match:
-            return match.group(1)
-        else:
-            print("❌ Could not parse GitHub repo from remote URL.")
-            print(f"Remote URL: {result}")
+def load_r2_credentials(token_file="OTA/token.txt"):
+    if not os.path.exists(token_file):
+        print(f"❌ Missing required token file: {token_file}")
+        sys.exit(1)
+
+    creds = {}
+    with open(token_file, "r") as f:
+        for line in f:
+            if "=" in line:
+                key, value = line.strip().split("=", 1)
+                creds[key.strip()] = value.strip()
+
+    required_keys = ["account_id", "access_key", "secret_key", "r2_bucket", "pub_dwnld_id"]
+    for key in required_keys:
+        if key not in creds:
+            print(f"❌ Missing '{key}' in token.txt")
             sys.exit(1)
-    except subprocess.CalledProcessError:
-        print("❌ Failed to detect git remote. Make sure you're in a Git repo.")
-        sys.exit(1)
 
-def get_release_by_tag(repo, tag, headers):
-    url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
-    r = requests.get(url, headers=headers)
-    if r.status_code == 200:
-        return r.json()
-    elif r.status_code == 404:
-        return None
-    else:
-        print(f"❌ Failed to get release info: {r.status_code} {r.text}")
-        sys.exit(1)
-
-def create_release(repo, tag, release_title, headers):
-    url = f"https://api.github.com/repos/{repo}/releases"
-    data = {
-        "tag_name": tag,
-        "name": release_title,
-        "body": f"OTA release for {tag}",
-        "draft": False,
-        "prerelease": False
-    }
-    r = requests.post(url, headers=headers, json=data)
-    if r.status_code == 201:
-        return r.json()
-    else:
-        print(f"❌ Failed to create release: {r.status_code} {r.text}")
-        sys.exit(1)
-
-def upload_asset(upload_url, filename, headers, description, existing_assets):
-    basename = os.path.basename(filename)
-    if any(asset["name"] == basename for asset in existing_assets):
-        print(f"⚠️ {description} '{basename}' already uploaded, skipping.")
-        return
-
-    file_size = os.path.getsize(filename)
-    headers = headers.copy()
-    headers["Content-Type"] = "application/octet-stream"
-    upload_url = upload_url.split("{")[0] + f"?name={basename}"
-
-    print(f"\nUploading {description}:")
-    with open(filename, "rb") as f:
-        with tqdm.wrapattr(f, "read", total=file_size, unit="B", unit_scale=True, desc=basename) as wrapped:
-            r = requests.post(upload_url, headers=headers, data=wrapped)
-
-    if r.status_code in (200, 201):
-        print(f"✅ Upload successful: {basename}")
-    else:
-        print(f"❌ Upload failed for {basename}: {r.status_code} {r.text}")
-        sys.exit(1)
-
-def upload_to_gh_release(repo, tag, files_with_desc, token, release_title):
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
-    release = get_release_by_tag(repo, tag, headers)
-    if release is None:
-        release = create_release(repo, tag, release_title, headers)
-    else:
-        print(f"ℹ️ Tag already exists. Uploading...")
-
-    upload_url = release["upload_url"]
-    existing_assets = release.get("assets", [])
-
-    for filename, desc in files_with_desc:
-        upload_asset(upload_url, filename, headers, desc, existing_assets)
+    return creds
 
 def main():
-    skip_upload = "--no-upload" in sys.argv
-
+    print("\U0001f527 Starting OTA generator...")
     codename = input("Enter device codename (e.g. PL2, miatoll): ").strip()
     ota_package_dir = f"out/target/product/{codename}"
 
+    print(f"🔎 Searching for OTA ZIP in {ota_package_dir}")
     try:
         files = [f for f in os.listdir(ota_package_dir) if f.startswith("AndroidOne-") and codename in f and f.endswith(".zip")]
     except FileNotFoundError:
@@ -140,37 +109,27 @@ def main():
         sys.exit(1)
 
     if not files:
-        print(f"❌ No OTA zip matching codename '{codename}' found in {ota_package_dir}.")
+        print(f"❌ No OTA zip found for codename '{codename}'")
         sys.exit(1)
 
     ota_filename = files[0]
     ota_file_path = os.path.join(ota_package_dir, ota_filename)
     print(f"✅ Found OTA package: {ota_file_path}")
 
-    recovery_path = os.path.join(ota_package_dir, "recovery.img")
-    files_to_upload = []
-
-    if os.path.isfile(recovery_path):
-        print(f"✅ Found recovery.img: {recovery_path}")
-        files_to_upload.append((recovery_path, "Recovery Image"))
-    else:
-        print("ℹ️ recovery.img not found, skipping recovery upload.")
-
-    files_to_upload.append((ota_file_path, "ROM"))
-
     match = re.match(r"AndroidOne-(?P<codename>.+?)-OTA-\d{8}-(?P<build>\d+)\.zip", ota_filename)
     if match:
         extracted_codename = match.group("codename")
         build_number = match.group("build")
-        tag = f"{extracted_codename}-{build_number}"
+        print(f"🔢 Parsed codename: {extracted_codename}, Build: {build_number}")
     else:
-        print("❌ Failed to parse tag from filename.")
+        print("❌ Filename pattern incorrect")
         sys.exit(1)
 
     build_prop_path = os.path.join(ota_package_dir, "system", "build.prop")
     datetime_utc = "UNKNOWN"
     security_patch = "UNKNOWN"
 
+    print("📄 Reading build.prop...")
     if os.path.exists(build_prop_path):
         try:
             with open(build_prop_path, "r") as f:
@@ -182,53 +141,45 @@ def main():
         except Exception:
             pass
 
-    if security_patch != "UNKNOWN":
-        try:
-            parsed_date = datetime.strptime(security_patch, "%Y-%m-%d")
-            formatted_patch = parsed_date.strftime("%B-%Y")
-        except ValueError:
-            formatted_patch = security_patch
-    else:
-        formatted_patch = "UNKNOWN"
+    try:
+        parsed_date = datetime.strptime(security_patch, "%Y-%m-%d")
+        formatted_patch = parsed_date.strftime("%B-%Y")
+    except Exception:
+        formatted_patch = security_patch
 
-    release_title = f"AndroidOne Experience | {extracted_codename} | ASB: {formatted_patch}"
-    id_hash = sha256sum(ota_file_path)
-    size = os.path.getsize(ota_file_path)
-    version = "15"
+    # Load R2 credentials
+    creds = load_r2_credentials()
+    r2_endpoint = f"https://{creds['account_id']}.r2.cloudflarestorage.com"
+    r2_bucket = creds['r2_bucket']
 
-    repo = detect_repo_from_git()
-    url = f"https://github.com/{repo}/releases/download/{tag}/{ota_filename}"
+    # Upload to R2
+    upload_to_r2(r2_bucket, ota_file_path, r2_endpoint, creds['access_key'], creds['secret_key'])
 
-    data = {
+    # Prepare OTA JSON
+    download_url = f"https://pub-{creds['pub_dwnld_id']}.r2.dev/{ota_filename}"
+    file_id = sha256sum(ota_file_path)
+    file_size = os.path.getsize(ota_file_path)
+
+    ota_json = {
         "response": [
             {
                 "datetime": datetime_utc,
                 "filename": ota_filename,
-                "id": id_hash,
-                "size": size,
-                "url": url,
-                "version": version,
+                "id": file_id,
+                "size": file_size,
+                "url": download_url,
+                "version": "15"
             }
         ]
     }
 
-    output_dir = "./OTA/devices"
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"{codename}.json")
+    os.makedirs("./OTA/devices", exist_ok=True)
+    output_path = f"./OTA/devices/{codename}.json"
+    with open(output_path, "w") as f:
+        json.dump(ota_json, f, indent=2)
 
-    try:
-        with open(output_file, "w") as f:
-            json.dump(data, f, indent=2)
-        print(f"✅ OTA JSON saved to {output_file}")
-    except Exception as e:
-        print(f"❌ Failed to write JSON: {e}")
-        sys.exit(1)
-
-    if not skip_upload:
-        token = read_github_token()
-        upload_to_gh_release(repo, tag, files_to_upload, token, release_title)
-    else:
-        print("📦 Skipping GitHub upload (because --no-upload was passed)")
+    print(f"📄 OTA JSON saved to: {output_path}")
+    print(f"🔗 Download URL: {download_url}")
 
 if __name__ == "__main__":
     main()
