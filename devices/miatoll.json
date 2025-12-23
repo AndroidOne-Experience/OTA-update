@@ -1,11 +1,11 @@
 {
   "response": [
     {
-      "datetime": "1764148020",
-      "filename": "AndroidOne-miatoll-OTA-20251126-0909.zip",
-      "id": "20feccdbbe4a6c9851d05122dc4d98e988abaebd9c55768d15304cc30837b79f",
-      "size": 2652858445,
-      "url": "https://pub-ca1b1c1fc942462380c5957492e9ff80.r2.dev/miatoll/AndroidOne-miatoll-OTA-20251126-0909.zip",
+      "datetime": "1766515344",
+      "filename": "AndroidOne-miatoll-OTA-20251223-1844.zip",
+      "id": "32388edd70184fe349628be5a4d8a8af48730e5d564ff10ca82cbc6f9e5bbcea",
+      "size": 2623549914,
+      "url": "https://pub-ca1b1c1fc942462380c5957492e9ff80.r2.dev/miatoll/AndroidOne-miatoll-OTA-20251223-1844.zip",
       "version": "15"
     }
   ]
