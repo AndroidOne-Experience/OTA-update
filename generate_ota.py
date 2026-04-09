@@ -2,9 +2,6 @@ import os
 import sys
 import hashlib
 import json
-import re
-import time
-from datetime import datetime
 
 try:
     import boto3
@@ -18,6 +15,11 @@ except ImportError:
     from tqdm import tqdm
 
 
+def print_section(title):
+    print()
+    print("#" * 24 + f" {title} " + "#" * 24)
+
+
 def sha256sum(filename):
     h = hashlib.sha256()
     with open(filename, "rb") as f:
@@ -26,178 +28,230 @@ def sha256sum(filename):
     return h.hexdigest()
 
 
-def upload_to_r2(bucket_name, file_path, r2_endpoint, access_key, secret_key, codename):
-    session = boto3.session.Session()
-    s3 = session.client(
-        service_name="s3",
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-        endpoint_url=r2_endpoint
+# ================= R2 =================
+def upload_to_r2(bucket, file_path, endpoint, access, secret, codename):
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access,
+        aws_secret_access_key=secret
     )
 
     filename = os.path.basename(file_path)
-    key_path = f"{codename}/{filename}"
-    file_size = os.path.getsize(file_path)
+    key = f"{codename}/{filename}"
+    size = os.path.getsize(file_path)
 
     config = TransferConfig(
-        multipart_threshold=1024 * 1024 * 100,  # 100 MB per part
-        multipart_chunksize=1024 * 1024 * 100,  # 100 MB per chunk
+        multipart_threshold=100 * 1024 * 1024,
+        multipart_chunksize=100 * 1024 * 1024,
         use_threads=True
     )
 
-    # Upload with progress bar and emoji
     with tqdm(
-        total=file_size,
+        total=size,
         ncols=60,
         bar_format=f"📤 Uploading: {filename} | transferred: {{n_fmt}}/{{total_fmt}} | rate: {{rate_fmt}} ",
-        leave=True,
-        dynamic_ncols=False,
-        unit='',            
+        unit='',
         unit_scale=True
-    ) as progress:
-        def progress_callback(bytes_transferred):
-            progress.update(bytes_transferred)
+    ) as p:
 
-        try:
-            s3.upload_file(
-                Filename=file_path,
-                Bucket=bucket_name,
-                Key=key_path,
-                ExtraArgs={"ACL": "public-read"},
-                Config=config,
-                Callback=progress_callback
-            )
-            progress.close()
-            print(f"✅ {filename} uploaded successfully to R2: {key_path}")
-        except Exception as e:
-            progress.close()
-            print(f"❌ Failed to upload {filename} to R2: {e}")
-            sys.exit(1)
+        def cb(x):
+            p.update(x)
+
+        s3.upload_file(file_path, bucket, key,
+                       ExtraArgs={"ACL": "public-read"},
+                       Config=config,
+                       Callback=cb)
+
+    print(f"✅ {filename} uploaded successfully to R2: {key}")
 
 
-def load_r2_credentials(base_dir, token_file="token.txt"):
-    # Determine token path relative to base_dir
-    if os.path.basename(base_dir) == "OTA":
-        token_path = os.path.join(base_dir, token_file)
-    else:
-        token_path = os.path.join(base_dir, "OTA", token_file)
+# ================= SourceForge =================
+def upload_to_sourceforge(file_path, user, password, project, branch, codename):
+    filename = os.path.basename(file_path)
 
-    if not os.path.exists(token_path):
-        print(f"❌ Missing required token file: {token_path}")
+    remote_dir = f"/home/frs/project/{project}/{codename}/{branch}/"
+
+    print(f"📤 Uploading: {filename}")
+
+    cmd = (
+        f"sshpass -p '{password}' rsync -a "
+        f"--info=progress2 --no-inc-recursive "
+        f"-e 'ssh -o StrictHostKeyChecking=no' "
+        f"'{file_path}' "
+        f"{user}@frs.sourceforge.net:{remote_dir}"
+    )
+
+    if os.system(cmd) != 0:
+        print(f"❌ Failed to upload {filename}")
         sys.exit(1)
 
-    creds = {}
-    with open(token_path, "r") as f:
-        for line in f:
-            if "=" in line:
-                key, value = line.strip().split("=", 1)
-                creds[key.strip()] = value.strip()
+    print(f"✅ {filename} uploaded successfully to SourceForge: {codename}/{branch}/{filename}")
 
-    required_keys = ["account_id", "access_key", "secret_key", "r2_bucket", "pub_dwnld_id"]
-    for key in required_keys:
-        if key not in creds:
-            print(f"❌ Missing '{key}' in token.txt")
+def ensure_sourceforge_known_host():
+    os.makedirs(os.path.expanduser("~/.ssh"), exist_ok=True)
+    os.system("ssh-keyscan frs.sourceforge.net >> ~/.ssh/known_hosts 2>/dev/null")
+
+
+# ================= CONFIG =================
+def load_credentials(base):
+    path = os.path.join(base, "OTA/token.txt") if os.path.basename(base) != "OTA" else "token.txt"
+
+    if not os.path.exists(path):
+        print("❌ token.txt missing")
+        sys.exit(1)
+
+    d = {}
+    for line in open(path):
+        if "=" in line:
+            k, v = line.strip().split("=", 1)
+            d[k.strip()] = v.strip()
+
+    keys = [
+        "account_id", "access_key", "secret_key",
+        "r2_bucket", "pub_dwnld_id",
+        "sf_username", "sf_pass", "sf_project", "sf_branch",
+        "version"
+    ]
+
+    for k in keys:
+        if k not in d:
+            print(f"❌ Missing {k}")
             sys.exit(1)
 
-    return creds
+    return d
 
 
+# ================= MAIN =================
 def main():
-    print("\U0001f527 Starting OTA generator...")
+    print("🔧 Starting OTA generator...")
 
-    codename = input("📱 Enter device codename (e.g. PL2, miatoll): ").strip()
+    mode = "ALL"
+    if len(sys.argv) > 2 and sys.argv[1] == "--upload":
+        m = sys.argv[2].upper()
+        if m in ["R2", "SF"]:
+            mode = m
 
-    # Handle running inside OTA/ folder
-    cwd = os.getcwd()
-    if os.path.basename(cwd) == "OTA":
-        base_dir = os.path.abspath(os.path.join(cwd, ".."))
-    else:
-        base_dir = cwd
+    codename = input("📱 Enter device codename: ").strip()
 
-    ota_package_dir = os.path.join(base_dir, f"out/target/product/{codename}")
+    base = os.path.abspath("..") if os.path.basename(os.getcwd()) == "OTA" else os.getcwd()
+    out = os.path.join(base, f"out/target/product/{codename}")
 
-    print(f"🔎 Searching for OTA ZIP in {ota_package_dir}")
+    print(f"🔎 Searching in {out}")
+
     try:
-        files = [f for f in os.listdir(ota_package_dir) if f.startswith("AndroidOne-") and codename in f and f.endswith(".zip")]
-    except FileNotFoundError:
-        print(f"❌ OTA package directory not found: {ota_package_dir}")
+        files = [
+            f for f in os.listdir(out)
+            if f.startswith("AndroidOne-") and codename in f and f.endswith(".zip")
+        ]
+    except:
+        print("❌ OTA folder missing")
         sys.exit(1)
 
     if not files:
-        print(f"❌ No OTA zip found for codename '{codename}'")
+        print("❌ AndroidOne OTA not found")
         sys.exit(1)
 
-    ota_filename = files[0]
-    ota_file_path = os.path.join(ota_package_dir, ota_filename)
-    print(f"✅ Found OTA package: {ota_file_path}")
+    files.sort(reverse=True)
+    ota = files[0]
+    ota_path = os.path.join(out, ota)
 
-    match = re.match(r"AndroidOne-(?P<codename>.+?)-OTA-\d{8}-(?P<build>\d+)\.zip", ota_filename)
-    if match:
-        extracted_codename = match.group("codename")
-        build_number = match.group("build")
-        print(f"🔢 Parsed codename: {extracted_codename}, Build: {build_number}")
-    else:
-        print("❌ Filename pattern incorrect")
-        sys.exit(1)
+    print(f"📦 Found OTA: {ota_path}")
 
-    build_prop_path = os.path.join(ota_package_dir, "system", "build.prop")
+    # ===== DATETIME =====
+    build_prop = os.path.join(out, "system/build.prop")
     datetime_utc = "UNKNOWN"
-    security_patch = "UNKNOWN"
 
     print("📄 Reading build.prop...")
-    if os.path.exists(build_prop_path):
+
+    if os.path.exists(build_prop):
         try:
-            with open(build_prop_path, "r") as f:
+            with open(build_prop, "r") as f:
                 for line in f:
                     if line.startswith("ro.build.date.utc="):
                         datetime_utc = line.strip().split("=", 1)[1]
-                    elif line.startswith("ro.build.version.security_patch="):
-                        security_patch = line.strip().split("=", 1)[1]
+                        break
         except Exception:
             pass
 
-    try:
-        parsed_date = datetime.strptime(security_patch, "%Y-%m-%d")
-        formatted_patch = parsed_date.strftime("%B-%Y")
-    except Exception:
-        formatted_patch = security_patch
+    rec = os.path.join(out, "recovery.img")
+    creds = load_credentials(base)
 
-    # Load R2 credentials
-    creds = load_r2_credentials(base_dir)
-    r2_endpoint = f"https://{creds['account_id']}.r2.cloudflarestorage.com"
-    r2_bucket = creds['r2_bucket']
+    r2_ep = f"https://{creds['account_id']}.r2.cloudflarestorage.com"
 
-    # Upload to R2
-    upload_to_r2(r2_bucket, ota_file_path, r2_endpoint, creds['access_key'], creds['secret_key'], codename)
+    # ===== R2 =====
+    if mode in ["ALL", "R2"]:
+        print_section("Cloudflare R2")
 
-    # Prepare OTA JSON
-    download_url = f"https://pub-{creds['pub_dwnld_id']}.r2.dev/{codename}/{ota_filename}"
-    file_id = sha256sum(ota_file_path)
-    file_size = os.path.getsize(ota_file_path)
+        upload_to_r2(creds['r2_bucket'], ota_path, r2_ep,
+                     creds['access_key'], creds['secret_key'], codename)
 
-    ota_json = {
-        "response": [
-            {
-                "datetime": datetime_utc,
-                "filename": ota_filename,
-                "id": file_id,
-                "size": file_size,
-                "url": download_url,
-                "version": "15"
-            }
-        ]
+        if os.path.exists(rec):
+            upload_to_r2(creds['r2_bucket'], rec, r2_ep,
+                         creds['access_key'], creds['secret_key'], codename)
+
+        print("#" * 24 + " Cloudflare R2 " + "#" * 24)
+
+    # ===== SF =====
+    if mode in ["ALL", "SF"]:
+        print_section("SourceForge")
+
+        ensure_sourceforge_known_host()
+
+        upload_to_sourceforge(ota_path,
+                              creds['sf_username'],
+                              creds['sf_pass'],
+                              creds['sf_project'],
+                              creds['sf_branch'],
+                              codename)
+
+        if os.path.exists(rec):
+            upload_to_sourceforge(rec,
+                                  creds['sf_username'],
+                                  creds['sf_pass'],
+                                  creds['sf_project'],
+                                  creds['sf_branch'],
+                                  codename)
+
+        print("#" * 24 + " SourceForge " + "#" * 24)
+
+    # ===== URL =====
+    r2_url = f"https://pub-{creds['pub_dwnld_id']}.r2.dev/{codename}/{ota}"
+    sf_url = f"https://downloads.sourceforge.net/project/{creds['sf_project']}/{codename}/{creds['sf_branch']}/{ota}"
+
+    # JSON URL
+    if mode == "SF":
+        json_url = sf_url
+    else:
+        json_url = r2_url
+
+    # ===== JSON =====
+    data = {
+        "response": [{
+            "datetime": datetime_utc,
+            "filename": ota,
+            "id": sha256sum(ota_path),
+            "size": os.path.getsize(ota_path),
+            "url": json_url,
+            "version": creds["version"]
+        }]
     }
 
-    # Save OTA JSON inside OTA/devices/
-    devices_dir = os.path.join(base_dir, "OTA", "devices")
-    os.makedirs(devices_dir, exist_ok=True)
-    output_path = os.path.join(devices_dir, f"{codename}.json")
-    with open(output_path, "w") as f:
-        json.dump(ota_json, f, indent=2)
+    dev = os.path.join(base, "OTA/devices")
+    os.makedirs(dev, exist_ok=True)
 
-    print(f"📄 OTA JSON saved to: {output_path}")
-    print(f"🔗 Download URL: {download_url}")
+    out_json = os.path.join(dev, f"{codename}.json")
+    json.dump(data, open(out_json, "w"), indent=2)
 
+    print("\n📄 JSON:", out_json)
+
+    if mode == "ALL":
+        print("🔗 R2 URL:", r2_url)
+        print("🔗 SF URL:", sf_url)
+    elif mode == "R2":
+        print("🔗 URL:", r2_url)
+    elif mode == "SF":
+        print("🔗 URL:", sf_url)
 
 if __name__ == "__main__":
     main()
