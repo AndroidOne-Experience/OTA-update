@@ -1,2 +1,2 @@
-# 06-Apr-2025
-- Initial Android 15 QPR2 Build
+# What's new
+- Initial Android 16 QPR2 Build
