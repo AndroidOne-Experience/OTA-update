@@ -1,6 +1,15 @@
 # What's new
-- Android Security Patch 2026-04
-- Cover some more cases for Hide screen capture status
-- fixed screen burn-in issue
-- fixed left over bugs related to classic status bar icons
+- Add Dolby TrueHD codec support (AC4)
+- fixup! Dolby tuner EQ value visibility issue
+- fixes some left over Bluetooth bugs
+- Switched back to OSS audio HAL
+- Add EROFS support
+- Upstream with qcom-sm8150 LineageOS kernel changes
+- Switch to dark boot animation
+- Introduce per app GPU screen composition option under display settings
+- Add hidden SSID preference & client manager to manage the hotspot connection
+- Add Wallpaper effects (Magic Portrait Wallpaper)
+- fixes Always-on VPN, previously unable to re-connect after the reboot issue
+- fixes in-call vibration was not working issue
+- fixes lockscreen smartspace margin issue
 - Misc optimization & fixes
