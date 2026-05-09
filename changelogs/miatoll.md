@@ -1,15 +1,3 @@
 # What's new
-- Add Dolby TrueHD codec support (AC4)
-- fixup! Dolby tuner EQ value visibility issue
-- fixes some left over Bluetooth bugs
-- Switched back to OSS audio HAL
-- Add EROFS support
-- Upstream with qcom-sm8150 LineageOS kernel changes
-- Switch to dark boot animation
-- Introduce per app GPU screen composition option under display settings
-- Add hidden SSID preference & client manager to manage the hotspot connection
-- Add Wallpaper effects (Magic Portrait Wallpaper)
-- fixes Always-on VPN, previously unable to re-connect after the reboot issue
-- fixes in-call vibration was not working issue
-- fixes lockscreen smartspace margin issue
+- PIF related changes [IMPORTANT]
 - Misc optimization & fixes
