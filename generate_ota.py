@@ -14,12 +14,114 @@ import os
 import codecs
 import termios
 import tty
+import importlib
+import subprocess
+import shutil
+import signal
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
-import requests
-import msal
+
+REQUIRED_PACKAGES = ('requests', 'msal')
+
+
+def _clear_dependency_screen():
+    if sys.stdout.isatty():
+        print('\033[2J\033[3J\033[H', end='', flush=True)
+
+
+def _run_pip(python, packages):
+    return subprocess.run(
+        [str(python), '-m', 'pip', 'install', *packages],
+        text=True, capture_output=True)
+
+
+def _check_install(result):
+    if result.returncode:
+        if result.stdout:
+            print(result.stdout, end='')
+        if result.stderr:
+            print(result.stderr, end='', file=sys.stderr)
+        raise RuntimeError('Dependency installation failed.')
+
+
+def check_dependencies():
+    """Install missing packages, using a temporary venv when pip requires it.
+
+    Return the child exit status when the script runs in a separate environment.
+    The parent owns cleanup, so an existing .venv is never deleted.
+    """
+    missing = []
+    for package in REQUIRED_PACKAGES:
+        try:
+            importlib.import_module(package)
+        except ImportError:
+            missing.append(package)
+    if not missing:
+        return None
+    print(f"{YELLOW}Missing required packages: {', '.join(missing)}{RESET}")
+
+    print(f'{BLUE}Installing required dependencies{RESET}', flush=True)
+    result = _run_pip(sys.executable, missing)
+    if result.returncode == 0:
+        importlib.invalidate_caches()
+        print(f'{GREEN}Dependencies installed successfully.{RESET}', flush=True)
+        _clear_dependency_screen()
+        return None
+    output = ((result.stdout or '') + (result.stderr or '')).lower()
+    inside_venv = sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+    if inside_venv or not any(marker in output for marker in (
+            'externally-managed-environment', 'pep 668', 'no module named pip')):
+        _check_install(result)
+
+    venv_dir = Path.cwd() / '.venv'
+    python = venv_dir / 'bin' / 'python'
+    created = False
+    child = None
+    previous_handlers = {}
+
+    def stop_child(signum, frame):
+        if child is not None:
+            child.send_signal(signum)
+        raise SystemExit(128 + signum)
+
+    try:
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            previous_handlers[sig] = signal.signal(sig, stop_child)
+        if not venv_dir.exists() and not venv_dir.is_symlink():
+            # Reserve the directory before claiming ownership for cleanup.
+            venv_dir.mkdir()
+            created = True
+            print(f'{BLUE}Creating temporary virtual environment{RESET}', flush=True)
+            result = subprocess.run([sys.executable, '-m', 'venv', str(venv_dir)])
+            if result.returncode:
+                raise RuntimeError(
+                    'Could not create .venv. On Ubuntu, install venv support with '
+                    '`sudo apt install python3-venv`, then run this script again.')
+        if not (venv_dir / 'pyvenv.cfg').is_file() or not python.is_file():
+            raise RuntimeError(f'{venv_dir} is not a usable virtual environment.')
+        print(f'{BLUE}Installing required dependencies{RESET}', flush=True)
+        # A fresh environment cannot use packages installed in system Python.
+        _check_install(_run_pip(python, REQUIRED_PACKAGES))
+        print(f'{GREEN}Dependencies installed successfully.{RESET}', flush=True)
+        _clear_dependency_screen()
+        child = subprocess.Popen([
+            str(python), str(Path(__file__).resolve()), *sys.argv[1:]])
+        status = child.wait()
+        return status if status >= 0 else 128 - status
+    finally:
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        if created:
+            shutil.rmtree(venv_dir)
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 # Terminal output and transfer settings.
 YELLOW = '\x1b[93m'
@@ -744,7 +846,20 @@ def perform_json_generation(script_dir, aosp_root, device, android_version, ota_
     return json_path
 
 def main():
+    global requests, msal
     args = parse_arguments()
+    try:
+        status = check_dependencies()
+        if status is not None:
+            return status
+        requests = importlib.import_module('requests')
+        msal = importlib.import_module('msal')
+    except (KeyboardInterrupt, EOFError):
+        print('\nDependency setup cancelled.')
+        return 130
+    except Exception as error:
+        print(f'Dependency setup failed: {error}', file=sys.stderr)
+        return 1
     operation = 'Upload' if args.upload else 'Operation'
     try:
         script_dir = Path(__file__).resolve().parent
